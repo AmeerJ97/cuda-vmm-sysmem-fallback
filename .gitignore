@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+
+# Dev docs (machine-specific investigation data, not for public repo)
+dev-docs/
+
+# Downloaded reference materials
+references/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# System
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.log
+*.prof
+*.nsys-rep
+*.ncu-rep
