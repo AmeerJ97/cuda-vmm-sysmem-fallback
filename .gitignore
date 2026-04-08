@@ -24,6 +24,9 @@ CLAUDE.md
 .DS_Store
 Thumbs.db
 
+# Test binaries
+tests/test_alloc
+
 # Test artifacts
 *.log
 *.prof
