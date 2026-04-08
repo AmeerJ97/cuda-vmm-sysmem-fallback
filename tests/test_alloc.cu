@@ -61,7 +61,7 @@ int main(void) {
     CUctxCreateParams ctxParams = {};
     CHECK_CUDA(cuCtxCreate(&ctx, &ctxParams, 0, dev));
 
-    /* Test 1: cuMemGetInfo reports inflated memory */
+    /* Test 1: cuMemGetInfo reports additional free fallback capacity */
     printf("=== Test 1: cuMemGetInfo spoofing ===\n");
     size_t free_mem, total_mem;
     CHECK_CUDA(cuMemGetInfo(&free_mem, &total_mem));
@@ -69,11 +69,12 @@ int main(void) {
            free_mem / (1024.0 * 1024.0 * 1024.0),
            total_mem / (1024.0 * 1024.0 * 1024.0));
 
-    /* With shim, total should be VRAM + sysmem max */
-    if (total_mem > 20ULL * 1024 * 1024 * 1024) {
-        printf("  PASS: total memory is inflated (shim active)\n");
+    /* With shim, free may be inflated while hardware total stays accurate. */
+    if (free_mem > 0 && total_mem > 0) {
+        printf("  PASS: cuMemGetInfo returned plausible free/total values\n");
     } else {
-        printf("  INFO: total memory not inflated (shim may not be loaded)\n");
+        printf("  FAIL: cuMemGetInfo returned invalid values\n");
+        exit(1);
     }
 
     /* Test 2: Allocate beyond VRAM */
