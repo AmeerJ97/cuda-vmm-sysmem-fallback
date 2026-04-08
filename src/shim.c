@@ -98,6 +98,35 @@ typedef struct {
 #define CU_DEVICE_ATTRIBUTE_VMM_SUPPORTED       102
 #define CU_DEVICE_ATTRIBUTE_HOST_NUMA_VMM       141
 
+/* ── NVML Types (for Ollama layer planner interception) ─────────── */
+/* Ollama's Go scheduler calls nvmlDeviceGetMemoryInfo to pre-compute
+ * n_gpu_layers. Without spoofing NVML, Ollama assigns overflow layers
+ * to CPU before any CUDA allocation happens. */
+
+typedef void *nvmlDevice_t;
+typedef int    nvmlReturn_t;
+#define NVML_SUCCESS 0
+
+typedef struct {
+    unsigned long long total;
+    unsigned long long free;
+    unsigned long long used;
+} nvmlMemory_t;
+
+typedef struct {
+    unsigned int       version;
+    unsigned long long total;
+    unsigned long long reserved;
+    unsigned long long free;
+    unsigned long long used;
+} nvmlMemory_v2_t;
+
+typedef nvmlReturn_t (*fn_nvmlDeviceGetMemoryInfo)(nvmlDevice_t, nvmlMemory_t*);
+typedef nvmlReturn_t (*fn_nvmlDeviceGetMemoryInfo_v2)(nvmlDevice_t, nvmlMemory_v2_t*);
+
+static fn_nvmlDeviceGetMemoryInfo    real_nvmlDeviceGetMemoryInfo;
+static fn_nvmlDeviceGetMemoryInfo_v2 real_nvmlDeviceGetMemoryInfo_v2;
+
 /* ── cuGetProcAddress Types ──────────────────────────────────────── */
 
 typedef unsigned long long cuuint64_t;
@@ -149,14 +178,19 @@ static fn_cuDeviceGetAttribute         real_cuDeviceGetAttribute;
 typedef enum {
     ALLOC_VRAM,
     ALLOC_SYSMEM,
+    ALLOC_SPLIT,    /* first portion in VRAM, remainder in sysmem */
 } alloc_location_t;
 
 typedef struct {
     CUdeviceptr                  ptr;
     size_t                       size;        /* requested size */
-    size_t                       padded_size; /* rounded to granularity */
+    size_t                       padded_size; /* total VA range (rounded to granularity) */
     alloc_location_t             location;
-    CUmemGenericAllocationHandle phys_handle;
+    CUmemGenericAllocationHandle phys_handle; /* sysmem handle (or sole handle for ALLOC_SYSMEM) */
+    /* Split allocation fields — only valid when location == ALLOC_SPLIT */
+    CUmemGenericAllocationHandle vram_handle; /* VRAM physical handle */
+    size_t                       vram_size;   /* bytes mapped in VRAM */
+    size_t                       sysmem_size; /* bytes mapped in sysmem */
     int                          occupied;
 } alloc_entry_t;
 
@@ -393,58 +427,132 @@ static int ensure_vmm_ready(void) {
     return g_vmm_supported;
 }
 
-/* ── VMM Sysmem Allocation ───────────────────────────────────────── */
+/* ── VMM Split Allocation ────────────────────────────────────────── */
+/* When cudaMalloc OOMs, instead of putting everything in sysmem,
+ * create a SPLIT allocation: first portion in VRAM, remainder in
+ * sysmem. Both mapped into a single contiguous GPU virtual address.
+ * GGML sees one pointer. GPU reads VRAM at 288 GB/s, sysmem at PCIe speed. */
 
-static CUresult vmm_alloc_sysmem(CUdeviceptr *dptr, size_t bytesize) {
+static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
     size_t padded = ((bytesize + g_granularity - 1) / g_granularity) * g_granularity;
 
-    /* Admission check under write lock — prevents TOCTOU overcommit */
-    pthread_rwlock_wrlock(&g_alloc_rwlock);
-    if (g_sysmem_used + padded > g_sysmem_max) {
+    /* Query real VRAM to determine split point */
+    fn_cuMemGetInfo_v2 meminfo_fn = get_real_cuMemGetInfo_v2();
+    size_t vram_free = 0, vram_total = 0;
+    if (meminfo_fn)
+        meminfo_fn(&vram_free, &vram_total);
+
+    /* Leave 512 MB headroom for KV cache, compute buffers, driver */
+    size_t headroom = 512ULL * 1024 * 1024;
+    size_t vram_usable = (vram_free > headroom) ? (vram_free - headroom) : 0;
+    /* Round down to granularity */
+    vram_usable = (vram_usable / g_granularity) * g_granularity;
+
+    size_t sysmem_portion = padded - vram_usable;
+    if (vram_usable >= padded) {
+        /* Shouldn't happen (we got here because cudaMalloc OOM'd), but handle it */
+        sysmem_portion = 0;
+        vram_usable = padded;
+    }
+    if (sysmem_portion == 0) {
+        /* Everything fits in VRAM — shouldn't reach here, but just in case */
+        vram_usable = padded;
+    }
+
+    /* Admission check for sysmem portion */
+    if (sysmem_portion > 0) {
+        pthread_rwlock_wrlock(&g_alloc_rwlock);
+        if (g_sysmem_used + sysmem_portion > g_sysmem_max) {
+            pthread_rwlock_unlock(&g_alloc_rwlock);
+            LOG_FALLBACK("cuMemAlloc(%zu) DENIED: sysmem limit (%.1f/%.1f GB)",
+                         bytesize,
+                         g_sysmem_used / (1024.0 * 1024.0 * 1024.0),
+                         g_sysmem_max / (1024.0 * 1024.0 * 1024.0));
+            return CUDA_ERROR_OUT_OF_MEMORY;
+        }
+        g_sysmem_used += sysmem_portion;
         pthread_rwlock_unlock(&g_alloc_rwlock);
-        LOG_FALLBACK("cuMemAlloc(%zu) DENIED: sysmem limit (%.1f/%.1f GB)",
-                     bytesize,
-                     g_sysmem_used / (1024.0 * 1024.0 * 1024.0),
-                     g_sysmem_max / (1024.0 * 1024.0 * 1024.0));
-        return CUDA_ERROR_OUT_OF_MEMORY;
-    }
-    /* Reserve the space before releasing the lock */
-    g_sysmem_used += padded;
-    pthread_rwlock_unlock(&g_alloc_rwlock);
-
-    /* 1. Create physical memory in system RAM */
-    CUmemAllocationProp prop;
-    memset(&prop, 0, sizeof(prop));
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-    prop.location.id = 0;
-
-    CUmemGenericAllocationHandle handle;
-    CUresult err = real_cuMemCreate(&handle, padded, &prop, 0);
-    if (err != CUDA_SUCCESS) {
-        LOG_FALLBACK("cuMemCreate FAILED: err=%d, size=%zu", err, padded);
-        goto fail_unreserve;
     }
 
-    /* 2. Reserve GPU virtual address range */
+    CUresult err;
+
+    /* 1. Reserve one contiguous VA range for the full allocation */
     CUdeviceptr va_ptr = 0;
     err = real_cuMemAddressReserve(&va_ptr, padded, g_granularity, 0, 0);
     if (err != CUDA_SUCCESS) {
         LOG_FALLBACK("cuMemAddressReserve FAILED: err=%d, size=%zu", err, padded);
-        real_cuMemRelease(handle);
         goto fail_unreserve;
     }
 
-    /* 3. Map virtual → physical */
-    err = real_cuMemMap(va_ptr, padded, 0, handle, 0);
-    if (err != CUDA_SUCCESS) {
-        LOG_FALLBACK("cuMemMap FAILED: err=%d, va=0x%llx, size=%zu", err, va_ptr, padded);
-        real_cuMemAddressFree(va_ptr, padded);
-        real_cuMemRelease(handle);
-        goto fail_unreserve;
+    /* 2. Create VRAM physical memory for the first portion */
+    CUmemGenericAllocationHandle vram_handle = 0;
+    if (vram_usable > 0) {
+        CUmemAllocationProp vram_prop;
+        memset(&vram_prop, 0, sizeof(vram_prop));
+        vram_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        vram_prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        vram_prop.location.id = g_device_id;
+
+        err = real_cuMemCreate(&vram_handle, vram_usable, &vram_prop, 0);
+        if (err != CUDA_SUCCESS) {
+            LOG_FALLBACK("cuMemCreate(VRAM, %zu) FAILED: err=%d — falling back to all-sysmem",
+                         vram_usable, err);
+            /* Fall back: put everything in sysmem */
+            pthread_rwlock_wrlock(&g_alloc_rwlock);
+            g_sysmem_used -= sysmem_portion;
+            g_sysmem_used += padded;
+            sysmem_portion = padded;
+            vram_usable = 0;
+            pthread_rwlock_unlock(&g_alloc_rwlock);
+        }
     }
 
-    /* 4. Grant GPU read/write access */
+    /* 3. Create sysmem physical memory for the overflow portion */
+    CUmemGenericAllocationHandle sysmem_handle = 0;
+    if (sysmem_portion > 0) {
+        CUmemAllocationProp host_prop;
+        memset(&host_prop, 0, sizeof(host_prop));
+        host_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        host_prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+        host_prop.location.id = 0;
+
+        err = real_cuMemCreate(&sysmem_handle, sysmem_portion, &host_prop, 0);
+        if (err != CUDA_SUCCESS) {
+            LOG_FALLBACK("cuMemCreate(HOST, %zu) FAILED: err=%d", sysmem_portion, err);
+            if (vram_usable > 0) real_cuMemRelease(vram_handle);
+            real_cuMemAddressFree(va_ptr, padded);
+            goto fail_unreserve;
+        }
+    }
+
+    /* 4. Map VRAM portion at the start of the VA range */
+    if (vram_usable > 0) {
+        err = real_cuMemMap(va_ptr, vram_usable, 0, vram_handle, 0);
+        if (err != CUDA_SUCCESS) {
+            LOG_FALLBACK("cuMemMap(VRAM) FAILED: err=%d", err);
+            real_cuMemRelease(vram_handle);
+            if (sysmem_portion > 0) real_cuMemRelease(sysmem_handle);
+            real_cuMemAddressFree(va_ptr, padded);
+            goto fail_unreserve;
+        }
+    }
+
+    /* 5. Map sysmem portion right after the VRAM portion */
+    if (sysmem_portion > 0) {
+        err = real_cuMemMap(va_ptr + vram_usable, sysmem_portion, 0, sysmem_handle, 0);
+        if (err != CUDA_SUCCESS) {
+            LOG_FALLBACK("cuMemMap(HOST) FAILED: err=%d", err);
+            if (vram_usable > 0) {
+                real_cuMemUnmap(va_ptr, vram_usable);
+                real_cuMemRelease(vram_handle);
+            }
+            real_cuMemRelease(sysmem_handle);
+            real_cuMemAddressFree(va_ptr, padded);
+            goto fail_unreserve;
+        }
+    }
+
+    /* 6. Grant GPU read/write access to the entire range */
     CUmemAccessDesc access;
     memset(&access, 0, sizeof(access));
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -453,22 +561,34 @@ static CUresult vmm_alloc_sysmem(CUdeviceptr *dptr, size_t bytesize) {
 
     err = real_cuMemSetAccess(va_ptr, padded, &access, 1);
     if (err != CUDA_SUCCESS) {
-        LOG_FALLBACK("cuMemSetAccess FAILED: err=%d, va=0x%llx", err, va_ptr);
+        LOG_FALLBACK("cuMemSetAccess FAILED: err=%d", err);
         real_cuMemUnmap(va_ptr, padded);
         real_cuMemAddressFree(va_ptr, padded);
-        real_cuMemRelease(handle);
+        if (vram_usable > 0) real_cuMemRelease(vram_handle);
+        if (sysmem_portion > 0) real_cuMemRelease(sysmem_handle);
         goto fail_unreserve;
     }
 
-    /* 5. Track allocation (under write lock) */
+    /* 7. Track allocation */
+    alloc_location_t loc_type = (vram_usable > 0 && sysmem_portion > 0) ? ALLOC_SPLIT :
+                                (sysmem_portion > 0) ? ALLOC_SYSMEM : ALLOC_VRAM;
+
     pthread_rwlock_wrlock(&g_alloc_rwlock);
-    if (alloc_map_insert(va_ptr, bytesize, padded, ALLOC_SYSMEM, handle) != 0) {
+    if (alloc_map_insert(va_ptr, bytesize, padded, loc_type, sysmem_handle) != 0) {
         pthread_rwlock_unlock(&g_alloc_rwlock);
         LOG_FALLBACK("alloc_map_insert FAILED: map full");
         real_cuMemUnmap(va_ptr, padded);
         real_cuMemAddressFree(va_ptr, padded);
-        real_cuMemRelease(handle);
+        if (vram_usable > 0) real_cuMemRelease(vram_handle);
+        if (sysmem_portion > 0) real_cuMemRelease(sysmem_handle);
         goto fail_unreserve;
+    }
+    /* Store split details in the entry */
+    alloc_entry_t *entry = alloc_map_lookup(va_ptr);
+    if (entry) {
+        entry->vram_handle = vram_handle;
+        entry->vram_size = vram_usable;
+        entry->sysmem_size = sysmem_portion;
     }
     if (g_sysmem_used > g_sysmem_peak)
         g_sysmem_peak = g_sysmem_used;
@@ -479,19 +599,23 @@ static CUresult vmm_alloc_sysmem(CUdeviceptr *dptr, size_t bytesize) {
 
     *dptr = va_ptr;
 
-    int active = atomic_load_explicit(&g_sysmem_alloc_count, memory_order_relaxed);
-    LOG_FALLBACK("cuMemAlloc(%zu) → sysmem fallback at 0x%llx (padded %zu) "
-                 "[active: %d allocs, %.1f/%.1f GB sysmem]",
-                 bytesize, va_ptr, padded, active,
+    LOG_FALLBACK("cuMemAlloc(%zu) → SPLIT: %.1f GB VRAM + %.1f GB sysmem at 0x%llx "
+                 "[%.1f/%.1f GB sysmem used]",
+                 bytesize,
+                 vram_usable / (1024.0 * 1024.0 * 1024.0),
+                 sysmem_portion / (1024.0 * 1024.0 * 1024.0),
+                 va_ptr,
                  g_sysmem_used / (1024.0 * 1024.0 * 1024.0),
                  g_sysmem_max / (1024.0 * 1024.0 * 1024.0));
 
     return CUDA_SUCCESS;
 
 fail_unreserve:
-    pthread_rwlock_wrlock(&g_alloc_rwlock);
-    g_sysmem_used -= padded;
-    pthread_rwlock_unlock(&g_alloc_rwlock);
+    if (sysmem_portion > 0) {
+        pthread_rwlock_wrlock(&g_alloc_rwlock);
+        g_sysmem_used -= sysmem_portion;
+        pthread_rwlock_unlock(&g_alloc_rwlock);
+    }
     return CUDA_ERROR_OUT_OF_MEMORY;
 }
 
@@ -527,7 +651,7 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
     if (!ensure_vmm_ready())
         return CUDA_ERROR_OUT_OF_MEMORY;
 
-    return vmm_alloc_sysmem(dptr, bytesize);
+    return vmm_alloc_split(dptr, bytesize);
 }
 
 /* ── cuMemFree_v2 Interception ───────────────────────────────────── */
@@ -551,11 +675,18 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
         return fn(dptr);
     }
 
-    /* Sysmem allocation — extract info and remove from map under lock */
+    /* VMM allocation (ALLOC_SYSMEM or ALLOC_SPLIT) — extract info under lock */
     size_t padded = entry->padded_size;
-    CUmemGenericAllocationHandle handle = entry->phys_handle;
+    CUmemGenericAllocationHandle sysmem_handle = entry->phys_handle;
+    CUmemGenericAllocationHandle vram_handle = entry->vram_handle;
+    size_t vram_size = entry->vram_size;
+    size_t sysmem_size = entry->sysmem_size;
+    alloc_location_t loc = entry->location;
     alloc_map_remove(dptr);
-    g_sysmem_used -= padded;
+    if (loc == ALLOC_SPLIT)
+        g_sysmem_used -= sysmem_size;
+    else
+        g_sysmem_used -= padded;
     pthread_rwlock_unlock(&g_alloc_rwlock);
 
     /* VMM cleanup — order matters: unmap before free, free before release */
@@ -564,16 +695,23 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
     err = real_cuMemUnmap(dptr, padded);
     if (err != CUDA_SUCCESS) {
         LOG_FALLBACK("WARNING: cuMemUnmap(0x%llx, %zu) failed: %d", dptr, padded, err);
-        return err; /* Don't proceed if unmap failed */
+        return err;
     }
 
     err = real_cuMemAddressFree(dptr, padded);
     if (err != CUDA_SUCCESS)
         LOG_FALLBACK("WARNING: cuMemAddressFree(0x%llx, %zu) failed: %d", dptr, padded, err);
 
-    err = real_cuMemRelease(handle);
-    if (err != CUDA_SUCCESS)
-        LOG_FALLBACK("WARNING: cuMemRelease failed: %d", err);
+    if (vram_size > 0 && vram_handle) {
+        err = real_cuMemRelease(vram_handle);
+        if (err != CUDA_SUCCESS)
+            LOG_FALLBACK("WARNING: cuMemRelease(VRAM) failed: %d", err);
+    }
+    if (sysmem_handle) {
+        err = real_cuMemRelease(sysmem_handle);
+        if (err != CUDA_SUCCESS)
+            LOG_FALLBACK("WARNING: cuMemRelease(sysmem) failed: %d", err);
+    }
 
     atomic_fetch_sub_explicit(&g_sysmem_alloc_count, 1, memory_order_relaxed);
 
@@ -696,6 +834,76 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
     return cuGetProcAddress_v2(symbol, pfn, cudaVersion, flags, symbolStatus);
 }
 
+/* ── NVML Interception ──────────────────────────────────────────── */
+/* Ollama's Go scheduler calls nvmlDeviceGetMemoryInfo via dlopen'd
+ * libnvidia-ml.so.1 to decide n_gpu_layers. Spoof free/total so
+ * Ollama assigns ALL layers to GPU, letting cuMemAlloc_v2 OOM trigger
+ * our VMM sysmem fallback for overflow allocations. */
+
+/* ── Real dlsym (forward declaration) ───────────────────────────── */
+/* Needed here so resolve_nvml_sym can bypass our dlsym interception.
+ * Full definition is in the "dlsym Interception" section below. */
+static void *(*g_real_dlsym)(void*, const char*);
+static void ensure_real_dlsym(void);
+
+/* Resolve NVML symbol without going through our dlsym hook */
+static void *resolve_nvml_sym(const char *name) {
+    void *lib = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_NOLOAD);
+    if (!lib) lib = dlopen("libnvidia-ml.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!lib) return NULL;
+    ensure_real_dlsym();
+    void *sym = NULL;
+    if (g_real_dlsym)
+        sym = g_real_dlsym(lib, name);
+    dlclose(lib);
+    return sym;
+}
+
+nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory) {
+    /* Real pointer is captured by our dlsym hook when Ollama resolves it.
+     * If not captured yet, resolve directly from libnvidia-ml.so.1. */
+    if (!real_nvmlDeviceGetMemoryInfo)
+        real_nvmlDeviceGetMemoryInfo = (fn_nvmlDeviceGetMemoryInfo)
+            resolve_nvml_sym("nvmlDeviceGetMemoryInfo");
+    if (!real_nvmlDeviceGetMemoryInfo || g_disabled)
+        return real_nvmlDeviceGetMemoryInfo ? real_nvmlDeviceGetMemoryInfo(device, memory) : 1;
+
+    nvmlReturn_t ret = real_nvmlDeviceGetMemoryInfo(device, memory);
+    if (ret != NVML_SUCCESS) return ret;
+
+    unsigned long long real_free = memory->free;
+    memory->free  += (unsigned long long)g_sysmem_max;
+    memory->total += (unsigned long long)g_sysmem_max;
+
+    LOG_FALLBACK("nvmlDeviceGetMemoryInfo: real_free=%.1f GB → spoofed_free=%.1f GB",
+                 real_free / (1024.0 * 1024.0 * 1024.0),
+                 memory->free / (1024.0 * 1024.0 * 1024.0));
+    return NVML_SUCCESS;
+}
+
+nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t *memory) {
+    if (!real_nvmlDeviceGetMemoryInfo_v2)
+        real_nvmlDeviceGetMemoryInfo_v2 = (fn_nvmlDeviceGetMemoryInfo_v2)
+            resolve_nvml_sym("nvmlDeviceGetMemoryInfo_v2");
+    if (!real_nvmlDeviceGetMemoryInfo_v2 || g_disabled) {
+        if (real_nvmlDeviceGetMemoryInfo_v2)
+            return real_nvmlDeviceGetMemoryInfo_v2(device, memory);
+        return 1;
+    }
+
+    nvmlReturn_t ret = real_nvmlDeviceGetMemoryInfo_v2(device, memory);
+    if (ret != NVML_SUCCESS) return ret;
+
+    unsigned long long real_free = memory->free;
+    memory->free  += (unsigned long long)g_sysmem_max;
+    memory->total += (unsigned long long)g_sysmem_max;
+
+    LOG_FALLBACK("nvmlDeviceGetMemoryInfo_v2: real_free=%.1f GB → spoofed_free=%.1f GB",
+                 real_free / (1024.0 * 1024.0 * 1024.0),
+                 memory->free / (1024.0 * 1024.0 * 1024.0));
+    return NVML_SUCCESS;
+}
+
 /* ── dlsym Interception ─────────────────────────────────────────── */
 /* NVIDIA's bundled cudart calls dlsym(handle, "cuGetProcAddress_v2") with
  * a direct handle to libcuda.so, bypassing LD_PRELOAD search order.
@@ -706,7 +914,7 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion,
  * dlvsym is NOT intercepted by us, so RTLD_NEXT resolves to glibc's
  * actual dlvsym. */
 
-static void *(*g_real_dlsym)(void*, const char*) = NULL;
+/* g_real_dlsym declared above (forward declaration for resolve_nvml_sym) */
 
 static void ensure_real_dlsym(void) {
     if (g_real_dlsym) return;
@@ -725,7 +933,7 @@ void *dlsym(void *handle, const char *symbol) {
 
     void *result = g_real_dlsym(handle, symbol);
 
-    /* Only intercept cuGetProcAddress lookups — everything else passes through */
+    /* Intercept cuGetProcAddress and NVML memory queries */
     if (!g_disabled && symbol) {
         if (strcmp(symbol, "cuGetProcAddress_v2") == 0 || strcmp(symbol, "cuGetProcAddress") == 0) {
             /* Stash the real cuGetProcAddress for our own use */
@@ -733,6 +941,20 @@ void *dlsym(void *handle, const char *symbol) {
                 atomic_store_explicit(&real_cuGetProcAddress_v2, (fn_cuGetProcAddress_v2)result, memory_order_release);
             LOG_DEBUG("dlsym('%s') → redirected to shim cuGetProcAddress_v2", symbol);
             return (void*)cuGetProcAddress_v2;
+        }
+        /* Intercept NVML memory queries — Ollama dlopen's libnvidia-ml.so.1
+         * and resolves nvmlDeviceGetMemoryInfo by name */
+        if (strcmp(symbol, "nvmlDeviceGetMemoryInfo") == 0) {
+            if (result && !real_nvmlDeviceGetMemoryInfo)
+                real_nvmlDeviceGetMemoryInfo = (fn_nvmlDeviceGetMemoryInfo)result;
+            LOG_DEBUG("dlsym('%s') → redirected to shim", symbol);
+            return (void*)nvmlDeviceGetMemoryInfo;
+        }
+        if (strcmp(symbol, "nvmlDeviceGetMemoryInfo_v2") == 0) {
+            if (result && !real_nvmlDeviceGetMemoryInfo_v2)
+                real_nvmlDeviceGetMemoryInfo_v2 = (fn_nvmlDeviceGetMemoryInfo_v2)result;
+            LOG_DEBUG("dlsym('%s') → redirected to shim", symbol);
+            return (void*)nvmlDeviceGetMemoryInfo_v2;
         }
     }
 
@@ -769,6 +991,16 @@ static void shim_init(void) {
             g_sysmem_max = ((size_t)pages * (size_t)page_size) / 2;
         else
             g_sysmem_max = 8ULL * 1024 * 1024 * 1024; /* 8 GB fallback */
+    }
+
+    /* Disable GGML unified memory — the shim replaces UVM's role.
+     * With GGML_CUDA_ENABLE_UNIFIED_MEMORY set, GGML uses cudaMallocManaged
+     * (which bypasses our cuMemAlloc_v2 interception) and reads /proc/meminfo
+     * (which bypasses our cuMemGetInfo_v2 spoofing). Without it, GGML uses
+     * cudaMalloc → cuMemAlloc_v2, and our shim catches OOM. */
+    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY")) {
+        unsetenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
+        LOG_FALLBACK("unset GGML_CUDA_ENABLE_UNIFIED_MEMORY (shim replaces UVM)");
     }
 
     LOG_FALLBACK("loaded: max_sysmem=%.1f GB, log_level=%d",
