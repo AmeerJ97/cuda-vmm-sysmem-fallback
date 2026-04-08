@@ -66,8 +66,8 @@ sequenceDiagram
 ```
 
 The shim also intercepts:
-- **NVML** (`nvmlDeviceGetMemoryInfo`) — spoofs inflated VRAM so Ollama's layer planner assigns all layers to GPU
-- **`cuMemGetInfo`** — reports VRAM + sysmem capacity
+- **NVML** (`nvmlDeviceGetMemoryInfo`) — spoofs additional free memory so Ollama's layer planner assigns all layers to GPU without inflating hardware total
+- **`cuMemGetInfo`** — reports extra fallback capacity in `free` while keeping `total` hardware-accurate
 - **`cuGetProcAddress`** / **`dlsym`** — intercepts bundled cudart that bypasses LD_PRELOAD symbol search order
 - **`GGML_CUDA_ENABLE_UNIFIED_MEMORY`** — automatically unset (forces `cudaMalloc` path for interception)
 
@@ -209,8 +209,11 @@ LD_PRELOAD=./libcuda_vmm_fallback.so ollama serve
 # Environment variables:
 #   CUDA_VMM_FALLBACK_LOG_LEVEL    0=silent 1=fallbacks 2=all (default: 1)
 #   CUDA_VMM_FALLBACK_MAX_SYSMEM   Max sysmem bytes (default: 50% RAM)
+#   CUDA_VMM_FALLBACK_POOL_SYSMEM  Optional pre-reserved host VMM pool in bytes
 #   CUDA_VMM_FALLBACK_DISABLE      Set to 1 to passthrough all calls
 ```
+
+`CUDA_VMM_FALLBACK_POOL_SYSMEM` lets the shim reserve a fixed host-backed VMM handle up front and suballocate overflow mappings from that pool. This does not provide WDDM-style dynamic migration, but it does give the process a pre-decided RAM budget for zero-copy overflow instead of creating a fresh host VMM allocation for each fallback.
 
 **Important:** The shim automatically unsets `GGML_CUDA_ENABLE_UNIFIED_MEMORY` because GGML's `cudaMallocManaged` path bypasses the shim's `cuMemAlloc` interception.
 

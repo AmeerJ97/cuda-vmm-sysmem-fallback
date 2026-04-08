@@ -11,6 +11,7 @@
  * Environment variables:
  *   CUDA_VMM_FALLBACK_LOG_LEVEL    0=silent 1=fallbacks 2=all (default: 1)
  *   CUDA_VMM_FALLBACK_MAX_SYSMEM   Max sysmem in bytes (default: 50% of RAM)
+ *   CUDA_VMM_FALLBACK_POOL_SYSMEM  Optional pre-reserved host VMM pool in bytes
  *   CUDA_VMM_FALLBACK_DISABLE      Set to 1 to passthrough all calls
  */
 
@@ -23,6 +24,7 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#include <errno.h>
 
 /* ── CUDA Driver API Types ───────────────────────────────────────────
  * Declared manually to avoid requiring CUDA toolkit headers at build time.
@@ -153,6 +155,7 @@ typedef CUresult (*fn_cuMemRelease)(CUmemGenericAllocationHandle);
 typedef CUresult (*fn_cuMemGetAllocationGranularity)(size_t*, const CUmemAllocationProp*, CUmemAllocationGranularity_flags);
 typedef CUresult (*fn_cuDeviceGet)(CUdevice*, int);
 typedef CUresult (*fn_cuDeviceGetAttribute)(int*, int, CUdevice);
+typedef CUresult (*fn_cuCtxGetDevice)(CUdevice*);
 
 /* ── Real Function Pointers (resolved via dlsym) ─────────────────── */
 
@@ -170,6 +173,7 @@ static fn_cuMemRelease                 real_cuMemRelease;
 static fn_cuMemGetAllocationGranularity real_cuMemGetAllocationGranularity;
 static fn_cuDeviceGet                  real_cuDeviceGet;
 static fn_cuDeviceGetAttribute         real_cuDeviceGetAttribute;
+static fn_cuCtxGetDevice               real_cuCtxGetDevice;
 
 /* ── Allocation Tracking Hash Map ────────────────────────────────── */
 
@@ -183,6 +187,7 @@ typedef enum {
 
 typedef struct {
     CUdeviceptr                  ptr;
+    CUdevice                     device;
     size_t                       size;        /* requested size */
     size_t                       padded_size; /* total VA range (rounded to granularity) */
     alloc_location_t             location;
@@ -191,11 +196,44 @@ typedef struct {
     CUmemGenericAllocationHandle vram_handle; /* VRAM physical handle */
     size_t                       vram_size;   /* bytes mapped in VRAM */
     size_t                       sysmem_size; /* bytes mapped in sysmem */
+    size_t                       sysmem_pool_offset; /* offset in pooled host handle */
+    int                          sysmem_from_pool;
     int                          occupied;
 } alloc_entry_t;
 
 static alloc_entry_t    g_alloc_map[ALLOC_MAP_SIZE];
 static pthread_rwlock_t g_alloc_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+#define DEVICE_CACHE_SIZE 16
+
+typedef struct {
+    CUdevice device;
+    size_t granularity;
+    int initialized;
+    int vmm_supported;
+} device_state_t;
+
+static device_state_t g_device_states[DEVICE_CACHE_SIZE];
+static pthread_mutex_t g_device_state_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define SYSMEM_POOL_MAX_RANGES 256
+
+typedef struct {
+    size_t offset;
+    size_t size;
+} sysmem_pool_range_t;
+
+typedef struct {
+    CUmemGenericAllocationHandle handle;
+    size_t size;
+    size_t granularity;
+    int initialized;
+    sysmem_pool_range_t free_ranges[SYSMEM_POOL_MAX_RANGES];
+    size_t free_range_count;
+} sysmem_pool_t;
+
+static sysmem_pool_t g_sysmem_pool;
+static pthread_mutex_t g_sysmem_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static inline size_t alloc_map_hash(CUdeviceptr ptr) {
     uint64_t v = (uint64_t)ptr;
@@ -203,7 +241,7 @@ static inline size_t alloc_map_hash(CUdeviceptr ptr) {
     return (size_t)(v % ALLOC_MAP_SIZE);
 }
 
-static int alloc_map_insert(CUdeviceptr ptr, size_t size, size_t padded_size,
+static int alloc_map_insert(CUdeviceptr ptr, CUdevice device, size_t size, size_t padded_size,
                             alloc_location_t location, CUmemGenericAllocationHandle handle) {
     /* Caller must hold write lock */
     size_t idx = alloc_map_hash(ptr);
@@ -211,10 +249,16 @@ static int alloc_map_insert(CUdeviceptr ptr, size_t size, size_t padded_size,
         size_t slot = (idx + i) % ALLOC_MAP_SIZE;
         if (!g_alloc_map[slot].occupied) {
             g_alloc_map[slot].ptr = ptr;
+            g_alloc_map[slot].device = device;
             g_alloc_map[slot].size = size;
             g_alloc_map[slot].padded_size = padded_size;
             g_alloc_map[slot].location = location;
             g_alloc_map[slot].phys_handle = handle;
+            g_alloc_map[slot].vram_handle = 0;
+            g_alloc_map[slot].vram_size = 0;
+            g_alloc_map[slot].sysmem_size = 0;
+            g_alloc_map[slot].sysmem_pool_offset = 0;
+            g_alloc_map[slot].sysmem_from_pool = 0;
             g_alloc_map[slot].occupied = 1;
             return 0;
         }
@@ -296,14 +340,13 @@ static _Atomic int g_vram_alloc_count    = 0;
 
 /* Immutable after init */
 static size_t  g_sysmem_max          = 0;
-static size_t  g_granularity         = 0;
-static int     g_device_id           = 0;
+static size_t  g_sysmem_pool_target  = 0;
 static int     g_log_level           = 1;
 static int     g_disabled            = 0;
 
-/* VMM init state — protected by pthread_once */
+/* VMM symbol init state — protected by pthread_once */
 static pthread_once_t g_vmm_once     = PTHREAD_ONCE_INIT;
-static int     g_vmm_supported       = 0;
+static int     g_vmm_symbols_ready   = 0;
 
 /* ── Logging ─────────────────────────────────────────────────────── */
 
@@ -325,6 +368,145 @@ static void *resolve_cuda_sym(const char *name) {
         }
     }
     return sym;
+}
+
+static size_t get_sysmem_used_snapshot(void) {
+    size_t used;
+    pthread_rwlock_rdlock(&g_alloc_rwlock);
+    used = g_sysmem_used;
+    pthread_rwlock_unlock(&g_alloc_rwlock);
+    return used;
+}
+
+static size_t get_sysmem_available_snapshot(void) {
+    size_t used = get_sysmem_used_snapshot();
+    return (used <= g_sysmem_max) ? (g_sysmem_max - used) : 0;
+}
+
+static int sysmem_pool_add_free_range_locked(size_t offset, size_t size) {
+    if (size == 0)
+        return 0;
+
+    size_t insert = 0;
+    while (insert < g_sysmem_pool.free_range_count &&
+           g_sysmem_pool.free_ranges[insert].offset < offset) {
+        insert++;
+    }
+
+    if (g_sysmem_pool.free_range_count >= SYSMEM_POOL_MAX_RANGES)
+        return -1;
+
+    for (size_t i = g_sysmem_pool.free_range_count; i > insert; i--)
+        g_sysmem_pool.free_ranges[i] = g_sysmem_pool.free_ranges[i - 1];
+
+    g_sysmem_pool.free_ranges[insert].offset = offset;
+    g_sysmem_pool.free_ranges[insert].size = size;
+    g_sysmem_pool.free_range_count++;
+
+    if (insert > 0) {
+        sysmem_pool_range_t *prev = &g_sysmem_pool.free_ranges[insert - 1];
+        sysmem_pool_range_t *curr = &g_sysmem_pool.free_ranges[insert];
+        if (prev->offset + prev->size == curr->offset) {
+            prev->size += curr->size;
+            for (size_t i = insert; i + 1 < g_sysmem_pool.free_range_count; i++)
+                g_sysmem_pool.free_ranges[i] = g_sysmem_pool.free_ranges[i + 1];
+            g_sysmem_pool.free_range_count--;
+            insert--;
+        }
+    }
+
+    if (insert + 1 < g_sysmem_pool.free_range_count) {
+        sysmem_pool_range_t *curr = &g_sysmem_pool.free_ranges[insert];
+        sysmem_pool_range_t *next = &g_sysmem_pool.free_ranges[insert + 1];
+        if (curr->offset + curr->size == next->offset) {
+            curr->size += next->size;
+            for (size_t i = insert + 1; i + 1 < g_sysmem_pool.free_range_count; i++)
+                g_sysmem_pool.free_ranges[i] = g_sysmem_pool.free_ranges[i + 1];
+            g_sysmem_pool.free_range_count--;
+        }
+    }
+
+    return 0;
+}
+
+static int ensure_sysmem_pool_ready(size_t granularity) {
+    if (g_sysmem_pool_target == 0)
+        return 0;
+
+    pthread_mutex_lock(&g_sysmem_pool_lock);
+    if (g_sysmem_pool.initialized) {
+        pthread_mutex_unlock(&g_sysmem_pool_lock);
+        return 1;
+    }
+
+    size_t pool_size = ((g_sysmem_pool_target + granularity - 1) / granularity) * granularity;
+    CUmemAllocationProp host_prop;
+    memset(&host_prop, 0, sizeof(host_prop));
+    host_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    host_prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+    host_prop.location.id = 0;
+
+    CUresult err = real_cuMemCreate(&g_sysmem_pool.handle, pool_size, &host_prop, 0);
+    if (err != CUDA_SUCCESS) {
+        pthread_mutex_unlock(&g_sysmem_pool_lock);
+        LOG_FALLBACK("WARNING: sysmem pool reservation FAILED: err=%d, size=%zu", err, pool_size);
+        return 0;
+    }
+
+    g_sysmem_pool.size = pool_size;
+    g_sysmem_pool.granularity = granularity;
+    g_sysmem_pool.initialized = 1;
+    g_sysmem_pool.free_range_count = 1;
+    g_sysmem_pool.free_ranges[0].offset = 0;
+    g_sysmem_pool.free_ranges[0].size = pool_size;
+    pthread_mutex_unlock(&g_sysmem_pool_lock);
+
+    LOG_FALLBACK("reserved sysmem VMM pool: %.1f GB", pool_size / (1024.0 * 1024.0 * 1024.0));
+    return 1;
+}
+
+static int sysmem_pool_alloc(size_t size, size_t *offset_out, CUmemGenericAllocationHandle *handle_out) {
+    if (g_sysmem_pool_target == 0 || !offset_out || !handle_out)
+        return 0;
+
+    pthread_mutex_lock(&g_sysmem_pool_lock);
+    if (!g_sysmem_pool.initialized) {
+        pthread_mutex_unlock(&g_sysmem_pool_lock);
+        return 0;
+    }
+
+    for (size_t i = 0; i < g_sysmem_pool.free_range_count; i++) {
+        sysmem_pool_range_t *range = &g_sysmem_pool.free_ranges[i];
+        if (range->size < size)
+            continue;
+
+        *offset_out = range->offset;
+        *handle_out = g_sysmem_pool.handle;
+        range->offset += size;
+        range->size -= size;
+        if (range->size == 0) {
+            for (size_t j = i; j + 1 < g_sysmem_pool.free_range_count; j++)
+                g_sysmem_pool.free_ranges[j] = g_sysmem_pool.free_ranges[j + 1];
+            g_sysmem_pool.free_range_count--;
+        }
+        pthread_mutex_unlock(&g_sysmem_pool_lock);
+        return 1;
+    }
+
+    pthread_mutex_unlock(&g_sysmem_pool_lock);
+    return 0;
+}
+
+static void sysmem_pool_free(size_t offset, size_t size) {
+    if (g_sysmem_pool_target == 0 || size == 0)
+        return;
+
+    pthread_mutex_lock(&g_sysmem_pool_lock);
+    if (g_sysmem_pool.initialized &&
+        sysmem_pool_add_free_range_locked(offset, size) != 0) {
+        LOG_FALLBACK("WARNING: sysmem pool free-range table exhausted");
+    }
+    pthread_mutex_unlock(&g_sysmem_pool_lock);
 }
 
 /* ── Intercepted Function Pointer Resolution ─────────────────────── */
@@ -370,61 +552,116 @@ static void vmm_init_once(void) {
     real_cuMemGetAllocationGranularity = (fn_cuMemGetAllocationGranularity)resolve_cuda_sym("cuMemGetAllocationGranularity");
     real_cuDeviceGet = (fn_cuDeviceGet)resolve_cuda_sym("cuDeviceGet");
     real_cuDeviceGetAttribute = (fn_cuDeviceGetAttribute)resolve_cuda_sym("cuDeviceGetAttribute");
+    real_cuCtxGetDevice = (fn_cuCtxGetDevice)resolve_cuda_sym("cuCtxGetDevice");
 
     if (!real_cuMemCreate || !real_cuMemAddressReserve || !real_cuMemMap ||
         !real_cuMemSetAccess || !real_cuMemUnmap || !real_cuMemAddressFree ||
         !real_cuMemRelease || !real_cuMemGetAllocationGranularity ||
-        !real_cuDeviceGet || !real_cuDeviceGetAttribute) {
+        !real_cuDeviceGet || !real_cuDeviceGetAttribute || !real_cuCtxGetDevice) {
         LOG_FALLBACK("VMM init FAILED: could not resolve all VMM symbols");
         return;
     }
 
-    CUdevice dev;
-    CUresult err = real_cuDeviceGet(&dev, 0);
-    if (err != CUDA_SUCCESS) {
-        LOG_FALLBACK("VMM init FAILED: cuDeviceGet returned %d", err);
-        return;
-    }
-    g_device_id = dev;
-
-    int vmm_attr = 0;
-    err = real_cuDeviceGetAttribute(&vmm_attr, CU_DEVICE_ATTRIBUTE_VMM_SUPPORTED, dev);
-    if (err != CUDA_SUCCESS || !vmm_attr) {
-        LOG_FALLBACK("VMM init FAILED: device does not support VMM (attr=%d, err=%d)", vmm_attr, err);
-        return;
-    }
-
-    int numa_vmm_attr = 0;
-    err = real_cuDeviceGetAttribute(&numa_vmm_attr, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VMM, dev);
-    if (err != CUDA_SUCCESS || !numa_vmm_attr) {
-        LOG_FALLBACK("WARNING: HOST_NUMA VMM not reported (attr=%d, err=%d), trying anyway", numa_vmm_attr, err);
-    }
-
-    CUmemAllocationProp prop;
-    memset(&prop, 0, sizeof(prop));
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-    prop.location.id = 0;
-
-    err = real_cuMemGetAllocationGranularity(&g_granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
-    if (err != CUDA_SUCCESS || g_granularity == 0) {
-        LOG_FALLBACK("VMM init FAILED: cuMemGetAllocationGranularity returned %d (granularity=%zu)", err, g_granularity);
-        return;
-    }
-
-    /* All checks passed — publish as supported. Order matters:
-     * g_granularity and g_device_id are already set above.
-     * g_vmm_supported is read by other threads after pthread_once returns. */
-    g_vmm_supported = 1;
-
-    LOG_FALLBACK("VMM initialized: device=%d, granularity=%zu bytes (%.1f MB), max_sysmem=%.1f GB",
-                 g_device_id, g_granularity, g_granularity / (1024.0 * 1024.0),
-                 g_sysmem_max / (1024.0 * 1024.0 * 1024.0));
+    g_vmm_symbols_ready = 1;
 }
 
-static int ensure_vmm_ready(void) {
+typedef struct {
+    CUdevice device;
+    size_t granularity;
+} vmm_device_config_t;
+
+static int get_active_device(CUdevice *device) {
+    if (!device)
+        return 0;
     pthread_once(&g_vmm_once, vmm_init_once);
-    return g_vmm_supported;
+    if (!g_vmm_symbols_ready)
+        return 0;
+
+    CUresult ctx_err = real_cuCtxGetDevice(device);
+    if (ctx_err == CUDA_SUCCESS)
+        return 1;
+
+    CUresult dev_err = real_cuDeviceGet(device, 0);
+    if (dev_err == CUDA_SUCCESS) {
+        LOG_FALLBACK("WARNING: cuCtxGetDevice failed (%d), falling back to device 0", ctx_err);
+        return 1;
+    }
+
+    LOG_FALLBACK("VMM init FAILED: could not determine active device (ctx_err=%d, dev0_err=%d)", ctx_err, dev_err);
+    return 0;
+}
+
+static int get_vmm_device_config(CUdevice device, vmm_device_config_t *config) {
+    if (!config)
+        return 0;
+
+    pthread_once(&g_vmm_once, vmm_init_once);
+    if (!g_vmm_symbols_ready)
+        return 0;
+
+    pthread_mutex_lock(&g_device_state_lock);
+
+    device_state_t *slot = NULL;
+    device_state_t *empty = NULL;
+    for (size_t i = 0; i < DEVICE_CACHE_SIZE; i++) {
+        if (g_device_states[i].initialized && g_device_states[i].device == device) {
+            slot = &g_device_states[i];
+            break;
+        }
+        if (!g_device_states[i].initialized && !empty)
+            empty = &g_device_states[i];
+    }
+
+    if (!slot) {
+        if (!empty) {
+            pthread_mutex_unlock(&g_device_state_lock);
+            LOG_FALLBACK("VMM init FAILED: device cache full");
+            return 0;
+        }
+
+        int vmm_attr = 0;
+        CUresult err = real_cuDeviceGetAttribute(&vmm_attr, CU_DEVICE_ATTRIBUTE_VMM_SUPPORTED, device);
+        if (err != CUDA_SUCCESS || !vmm_attr) {
+            pthread_mutex_unlock(&g_device_state_lock);
+            LOG_FALLBACK("VMM init FAILED: device %d does not support VMM (attr=%d, err=%d)", device, vmm_attr, err);
+            return 0;
+        }
+
+        int numa_vmm_attr = 0;
+        err = real_cuDeviceGetAttribute(&numa_vmm_attr, CU_DEVICE_ATTRIBUTE_HOST_NUMA_VMM, device);
+        if (err != CUDA_SUCCESS || !numa_vmm_attr)
+            LOG_FALLBACK("WARNING: device %d HOST_NUMA VMM not reported (attr=%d, err=%d), trying anyway", device, numa_vmm_attr, err);
+
+        CUmemAllocationProp prop;
+        memset(&prop, 0, sizeof(prop));
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+        prop.location.id = 0;
+
+        size_t granularity = 0;
+        err = real_cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+        if (err != CUDA_SUCCESS || granularity == 0) {
+            pthread_mutex_unlock(&g_device_state_lock);
+            LOG_FALLBACK("VMM init FAILED: device %d cuMemGetAllocationGranularity returned %d (granularity=%zu)",
+                         device, err, granularity);
+            return 0;
+        }
+
+        empty->device = device;
+        empty->granularity = granularity;
+        empty->initialized = 1;
+        empty->vmm_supported = 1;
+        slot = empty;
+
+        LOG_FALLBACK("VMM initialized: device=%d, granularity=%zu bytes (%.1f MB), max_sysmem=%.1f GB",
+                     device, granularity, granularity / (1024.0 * 1024.0),
+                     g_sysmem_max / (1024.0 * 1024.0 * 1024.0));
+    }
+
+    config->device = slot->device;
+    config->granularity = slot->granularity;
+    pthread_mutex_unlock(&g_device_state_lock);
+    return slot->vmm_supported;
 }
 
 /* ── VMM Split Allocation ────────────────────────────────────────── */
@@ -434,7 +671,23 @@ static int ensure_vmm_ready(void) {
  * GGML sees one pointer. GPU reads VRAM at 288 GB/s, sysmem at PCIe speed. */
 
 static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
-    size_t padded = ((bytesize + g_granularity - 1) / g_granularity) * g_granularity;
+    vmm_device_config_t config;
+    CUdevice device;
+    if (!get_active_device(&device) || !get_vmm_device_config(device, &config))
+        return CUDA_ERROR_OUT_OF_MEMORY;
+
+    size_t granularity = config.granularity;
+    size_t padded = ((bytesize + granularity - 1) / granularity) * granularity;
+    CUresult err;
+    CUresult result_err = CUDA_ERROR_OUT_OF_MEMORY;
+    CUdeviceptr va_ptr = 0;
+    CUmemGenericAllocationHandle vram_handle = 0;
+    CUmemGenericAllocationHandle sysmem_handle = 0;
+    int va_reserved = 0;
+    int vram_created = 0;
+    int sysmem_created = 0;
+    int vram_mapped = 0;
+    int sysmem_mapped = 0;
 
     /* Query real VRAM to determine split point */
     fn_cuMemGetInfo_v2 meminfo_fn = get_real_cuMemGetInfo_v2();
@@ -446,9 +699,12 @@ static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
     size_t headroom = 512ULL * 1024 * 1024;
     size_t vram_usable = (vram_free > headroom) ? (vram_free - headroom) : 0;
     /* Round down to granularity */
-    vram_usable = (vram_usable / g_granularity) * g_granularity;
+    vram_usable = (vram_usable / granularity) * granularity;
 
     size_t sysmem_portion = padded - vram_usable;
+    size_t reserved_sysmem = 0;
+    size_t sysmem_pool_offset = 0;
+    int sysmem_from_pool = 0;
     if (vram_usable >= padded) {
         /* Shouldn't happen (we got here because cudaMalloc OOM'd), but handle it */
         sysmem_portion = 0;
@@ -471,57 +727,69 @@ static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
             return CUDA_ERROR_OUT_OF_MEMORY;
         }
         g_sysmem_used += sysmem_portion;
+        reserved_sysmem = sysmem_portion;
         pthread_rwlock_unlock(&g_alloc_rwlock);
     }
 
-    CUresult err;
-
     /* 1. Reserve one contiguous VA range for the full allocation */
-    CUdeviceptr va_ptr = 0;
-    err = real_cuMemAddressReserve(&va_ptr, padded, g_granularity, 0, 0);
+    err = real_cuMemAddressReserve(&va_ptr, padded, granularity, 0, 0);
     if (err != CUDA_SUCCESS) {
         LOG_FALLBACK("cuMemAddressReserve FAILED: err=%d, size=%zu", err, padded);
+        result_err = err;
         goto fail_unreserve;
     }
+    va_reserved = 1;
 
     /* 2. Create VRAM physical memory for the first portion */
-    CUmemGenericAllocationHandle vram_handle = 0;
     if (vram_usable > 0) {
         CUmemAllocationProp vram_prop;
         memset(&vram_prop, 0, sizeof(vram_prop));
         vram_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         vram_prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        vram_prop.location.id = g_device_id;
+        vram_prop.location.id = device;
 
         err = real_cuMemCreate(&vram_handle, vram_usable, &vram_prop, 0);
         if (err != CUDA_SUCCESS) {
             LOG_FALLBACK("cuMemCreate(VRAM, %zu) FAILED: err=%d — falling back to all-sysmem",
                          vram_usable, err);
-            /* Fall back: put everything in sysmem */
+            /* Fall back: put everything in sysmem if the larger reservation fits. */
             pthread_rwlock_wrlock(&g_alloc_rwlock);
-            g_sysmem_used -= sysmem_portion;
-            g_sysmem_used += padded;
+            size_t extra_sysmem = padded - reserved_sysmem;
+            if (g_sysmem_used + extra_sysmem > g_sysmem_max) {
+                pthread_rwlock_unlock(&g_alloc_rwlock);
+                result_err = CUDA_ERROR_OUT_OF_MEMORY;
+                LOG_FALLBACK("cuMemAlloc(%zu) DENIED: all-sysmem fallback exceeds limit", bytesize);
+                goto fail_unreserve;
+            }
+            g_sysmem_used += extra_sysmem;
+            reserved_sysmem = padded;
+            pthread_rwlock_unlock(&g_alloc_rwlock);
             sysmem_portion = padded;
             vram_usable = 0;
-            pthread_rwlock_unlock(&g_alloc_rwlock);
+        } else {
+            vram_created = 1;
         }
     }
 
     /* 3. Create sysmem physical memory for the overflow portion */
-    CUmemGenericAllocationHandle sysmem_handle = 0;
     if (sysmem_portion > 0) {
-        CUmemAllocationProp host_prop;
-        memset(&host_prop, 0, sizeof(host_prop));
-        host_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        host_prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
-        host_prop.location.id = 0;
+        if (ensure_sysmem_pool_ready(granularity) &&
+            sysmem_pool_alloc(sysmem_portion, &sysmem_pool_offset, &sysmem_handle)) {
+            sysmem_from_pool = 1;
+        } else {
+            CUmemAllocationProp host_prop;
+            memset(&host_prop, 0, sizeof(host_prop));
+            host_prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            host_prop.location.type = CU_MEM_LOCATION_TYPE_HOST_NUMA;
+            host_prop.location.id = 0;
 
-        err = real_cuMemCreate(&sysmem_handle, sysmem_portion, &host_prop, 0);
-        if (err != CUDA_SUCCESS) {
-            LOG_FALLBACK("cuMemCreate(HOST, %zu) FAILED: err=%d", sysmem_portion, err);
-            if (vram_usable > 0) real_cuMemRelease(vram_handle);
-            real_cuMemAddressFree(va_ptr, padded);
-            goto fail_unreserve;
+            err = real_cuMemCreate(&sysmem_handle, sysmem_portion, &host_prop, 0);
+            if (err != CUDA_SUCCESS) {
+                LOG_FALLBACK("cuMemCreate(HOST, %zu) FAILED: err=%d", sysmem_portion, err);
+                result_err = err;
+                goto fail_unreserve;
+            }
+            sysmem_created = 1;
         }
     }
 
@@ -530,42 +798,34 @@ static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
         err = real_cuMemMap(va_ptr, vram_usable, 0, vram_handle, 0);
         if (err != CUDA_SUCCESS) {
             LOG_FALLBACK("cuMemMap(VRAM) FAILED: err=%d", err);
-            real_cuMemRelease(vram_handle);
-            if (sysmem_portion > 0) real_cuMemRelease(sysmem_handle);
-            real_cuMemAddressFree(va_ptr, padded);
+            result_err = err;
             goto fail_unreserve;
         }
+        vram_mapped = 1;
     }
 
     /* 5. Map sysmem portion right after the VRAM portion */
     if (sysmem_portion > 0) {
-        err = real_cuMemMap(va_ptr + vram_usable, sysmem_portion, 0, sysmem_handle, 0);
+        err = real_cuMemMap(va_ptr + vram_usable, sysmem_portion, sysmem_pool_offset, sysmem_handle, 0);
         if (err != CUDA_SUCCESS) {
             LOG_FALLBACK("cuMemMap(HOST) FAILED: err=%d", err);
-            if (vram_usable > 0) {
-                real_cuMemUnmap(va_ptr, vram_usable);
-                real_cuMemRelease(vram_handle);
-            }
-            real_cuMemRelease(sysmem_handle);
-            real_cuMemAddressFree(va_ptr, padded);
+            result_err = err;
             goto fail_unreserve;
         }
+        sysmem_mapped = 1;
     }
 
     /* 6. Grant GPU read/write access to the entire range */
     CUmemAccessDesc access;
     memset(&access, 0, sizeof(access));
     access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    access.location.id = g_device_id;
+    access.location.id = device;
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
 
     err = real_cuMemSetAccess(va_ptr, padded, &access, 1);
     if (err != CUDA_SUCCESS) {
         LOG_FALLBACK("cuMemSetAccess FAILED: err=%d", err);
-        real_cuMemUnmap(va_ptr, padded);
-        real_cuMemAddressFree(va_ptr, padded);
-        if (vram_usable > 0) real_cuMemRelease(vram_handle);
-        if (sysmem_portion > 0) real_cuMemRelease(sysmem_handle);
+        result_err = err;
         goto fail_unreserve;
     }
 
@@ -574,13 +834,10 @@ static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
                                 (sysmem_portion > 0) ? ALLOC_SYSMEM : ALLOC_VRAM;
 
     pthread_rwlock_wrlock(&g_alloc_rwlock);
-    if (alloc_map_insert(va_ptr, bytesize, padded, loc_type, sysmem_handle) != 0) {
+    if (alloc_map_insert(va_ptr, device, bytesize, padded, loc_type, sysmem_handle) != 0) {
         pthread_rwlock_unlock(&g_alloc_rwlock);
         LOG_FALLBACK("alloc_map_insert FAILED: map full");
-        real_cuMemUnmap(va_ptr, padded);
-        real_cuMemAddressFree(va_ptr, padded);
-        if (vram_usable > 0) real_cuMemRelease(vram_handle);
-        if (sysmem_portion > 0) real_cuMemRelease(sysmem_handle);
+        result_err = CUDA_ERROR_OUT_OF_MEMORY;
         goto fail_unreserve;
     }
     /* Store split details in the entry */
@@ -589,6 +846,8 @@ static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
         entry->vram_handle = vram_handle;
         entry->vram_size = vram_usable;
         entry->sysmem_size = sysmem_portion;
+        entry->sysmem_from_pool = sysmem_from_pool;
+        entry->sysmem_pool_offset = sysmem_pool_offset;
     }
     if (g_sysmem_used > g_sysmem_peak)
         g_sysmem_peak = g_sysmem_used;
@@ -611,12 +870,24 @@ static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
     return CUDA_SUCCESS;
 
 fail_unreserve:
-    if (sysmem_portion > 0) {
+    if (sysmem_mapped)
+        real_cuMemUnmap(va_ptr + vram_usable, sysmem_portion);
+    if (vram_mapped)
+        real_cuMemUnmap(va_ptr, vram_usable);
+    if (va_reserved)
+        real_cuMemAddressFree(va_ptr, padded);
+    if (sysmem_from_pool)
+        sysmem_pool_free(sysmem_pool_offset, sysmem_portion);
+    else if (sysmem_created)
+        real_cuMemRelease(sysmem_handle);
+    if (vram_created)
+        real_cuMemRelease(vram_handle);
+    if (reserved_sysmem > 0) {
         pthread_rwlock_wrlock(&g_alloc_rwlock);
-        g_sysmem_used -= sysmem_portion;
+        g_sysmem_used -= reserved_sysmem;
         pthread_rwlock_unlock(&g_alloc_rwlock);
     }
-    return CUDA_ERROR_OUT_OF_MEMORY;
+    return result_err;
 }
 
 /* ── cuMemAlloc_v2 Interception ──────────────────────────────────── */
@@ -635,8 +906,11 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
 
     if (err == CUDA_SUCCESS) {
         LOG_DEBUG("cuMemAlloc(%zu) → VRAM at 0x%llx", bytesize, *dptr);
+        CUdevice device = 0;
+        if (!get_active_device(&device))
+            device = 0;
         pthread_rwlock_wrlock(&g_alloc_rwlock);
-        if (alloc_map_insert(*dptr, bytesize, bytesize, ALLOC_VRAM, 0) != 0)
+        if (alloc_map_insert(*dptr, device, bytesize, bytesize, ALLOC_VRAM, 0) != 0)
             LOG_DEBUG("WARNING: alloc map full, VRAM alloc at 0x%llx untracked", *dptr);
         pthread_rwlock_unlock(&g_alloc_rwlock);
         atomic_fetch_add_explicit(&g_vram_alloc_count, 1, memory_order_relaxed);
@@ -647,10 +921,6 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
         return err;
 
     /* ── VRAM exhausted — attempt sysmem fallback ── */
-
-    if (!ensure_vmm_ready())
-        return CUDA_ERROR_OUT_OF_MEMORY;
-
     return vmm_alloc_split(dptr, bytesize);
 }
 
@@ -681,6 +951,8 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
     CUmemGenericAllocationHandle vram_handle = entry->vram_handle;
     size_t vram_size = entry->vram_size;
     size_t sysmem_size = entry->sysmem_size;
+    size_t sysmem_pool_offset = entry->sysmem_pool_offset;
+    int sysmem_from_pool = entry->sysmem_from_pool;
     alloc_location_t loc = entry->location;
     alloc_map_remove(dptr);
     if (loc == ALLOC_SPLIT)
@@ -707,7 +979,9 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
         if (err != CUDA_SUCCESS)
             LOG_FALLBACK("WARNING: cuMemRelease(VRAM) failed: %d", err);
     }
-    if (sysmem_handle) {
+    if (sysmem_from_pool) {
+        sysmem_pool_free(sysmem_pool_offset, sysmem_size);
+    } else if (sysmem_handle) {
         err = real_cuMemRelease(sysmem_handle);
         if (err != CUDA_SUCCESS)
             LOG_FALLBACK("WARNING: cuMemRelease(sysmem) failed: %d", err);
@@ -718,7 +992,7 @@ CUresult cuMemFree_v2(CUdeviceptr dptr) {
     int remaining = atomic_load_explicit(&g_sysmem_alloc_count, memory_order_relaxed);
     LOG_DEBUG("cuMemFree(0x%llx) → sysmem freed %zu bytes [remaining: %d allocs, %.1f GB]",
               dptr, padded, remaining,
-              g_sysmem_used / (1024.0 * 1024.0 * 1024.0));
+              get_sysmem_used_snapshot() / (1024.0 * 1024.0 * 1024.0));
 
     return CUDA_SUCCESS;
 }
@@ -735,13 +1009,9 @@ CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
         return err;
 
     size_t real_free = *free;
-
-    /* Guard against unsigned underflow */
-    size_t used = g_sysmem_used; /* snapshot — may be stale, that's OK for spoofing */
-    size_t sysmem_avail = (used <= g_sysmem_max) ? (g_sysmem_max - used) : 0;
+    size_t sysmem_avail = get_sysmem_available_snapshot();
 
     *free  = real_free + sysmem_avail;
-    *total = *total + g_sysmem_max;
 
     LOG_DEBUG("cuMemGetInfo: real_free=%.1f GB, spoofed_free=%.1f GB (sysmem_avail=%.1f GB)",
               real_free / (1024.0 * 1024.0 * 1024.0),
@@ -872,10 +1142,10 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t device, nvmlMemory_t *memory) 
     if (ret != NVML_SUCCESS) return ret;
 
     unsigned long long real_free = memory->free;
-    memory->free  += (unsigned long long)g_sysmem_max;
-    memory->total += (unsigned long long)g_sysmem_max;
+    unsigned long long sysmem_avail = (unsigned long long)get_sysmem_available_snapshot();
+    memory->free += sysmem_avail;
 
-    LOG_FALLBACK("nvmlDeviceGetMemoryInfo: real_free=%.1f GB → spoofed_free=%.1f GB",
+    LOG_DEBUG("nvmlDeviceGetMemoryInfo: real_free=%.1f GB → spoofed_free=%.1f GB",
                  real_free / (1024.0 * 1024.0 * 1024.0),
                  memory->free / (1024.0 * 1024.0 * 1024.0));
     return NVML_SUCCESS;
@@ -895,10 +1165,10 @@ nvmlReturn_t nvmlDeviceGetMemoryInfo_v2(nvmlDevice_t device, nvmlMemory_v2_t *me
     if (ret != NVML_SUCCESS) return ret;
 
     unsigned long long real_free = memory->free;
-    memory->free  += (unsigned long long)g_sysmem_max;
-    memory->total += (unsigned long long)g_sysmem_max;
+    unsigned long long sysmem_avail = (unsigned long long)get_sysmem_available_snapshot();
+    memory->free += sysmem_avail;
 
-    LOG_FALLBACK("nvmlDeviceGetMemoryInfo_v2: real_free=%.1f GB → spoofed_free=%.1f GB",
+    LOG_DEBUG("nvmlDeviceGetMemoryInfo_v2: real_free=%.1f GB → spoofed_free=%.1f GB",
                  real_free / (1024.0 * 1024.0 * 1024.0),
                  memory->free / (1024.0 * 1024.0 * 1024.0));
     return NVML_SUCCESS;
@@ -934,7 +1204,7 @@ void *dlsym(void *handle, const char *symbol) {
     void *result = g_real_dlsym(handle, symbol);
 
     /* Intercept cuGetProcAddress and NVML memory queries */
-    if (!g_disabled && symbol) {
+    if (!g_disabled) {
         if (strcmp(symbol, "cuGetProcAddress_v2") == 0 || strcmp(symbol, "cuGetProcAddress") == 0) {
             /* Stash the real cuGetProcAddress for our own use */
             if (result && !atomic_load_explicit(&real_cuGetProcAddress_v2, memory_order_acquire))
@@ -966,6 +1236,11 @@ void *dlsym(void *handle, const char *symbol) {
 __attribute__((constructor))
 static void shim_init(void) {
     const char *env;
+    size_t physical_ram = 0;
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page_size > 0)
+        physical_ram = (size_t)pages * (size_t)page_size;
 
     env = getenv("CUDA_VMM_FALLBACK_DISABLE");
     if (env && atoi(env)) {
@@ -979,18 +1254,41 @@ static void shim_init(void) {
     env = getenv("CUDA_VMM_FALLBACK_MAX_SYSMEM");
     if (env) {
         char *endptr;
-        long long val = strtoll(env, &endptr, 10);
-        if (endptr != env && val > 0)
+        errno = 0;
+        unsigned long long val = strtoull(env, &endptr, 10);
+        if (endptr == env || *endptr != '\0' || errno == ERANGE || val == 0) {
+            LOG_FALLBACK("WARNING: ignoring invalid CUDA_VMM_FALLBACK_MAX_SYSMEM='%s'", env);
+        } else if (physical_ram > 0 && val > (unsigned long long)physical_ram) {
+            LOG_FALLBACK("WARNING: ignoring CUDA_VMM_FALLBACK_MAX_SYSMEM='%s' above physical RAM", env);
+        } else {
             g_sysmem_max = (size_t)val;
+        }
+    }
+
+    env = getenv("CUDA_VMM_FALLBACK_POOL_SYSMEM");
+    if (env) {
+        char *endptr;
+        errno = 0;
+        unsigned long long val = strtoull(env, &endptr, 10);
+        if (endptr == env || *endptr != '\0' || errno == ERANGE) {
+            LOG_FALLBACK("WARNING: ignoring invalid CUDA_VMM_FALLBACK_POOL_SYSMEM='%s'", env);
+        } else {
+            g_sysmem_pool_target = (size_t)val;
+        }
     }
 
     if (g_sysmem_max == 0) {
-        long pages = sysconf(_SC_PHYS_PAGES);
-        long page_size = sysconf(_SC_PAGE_SIZE);
-        if (pages > 0 && page_size > 0)
-            g_sysmem_max = ((size_t)pages * (size_t)page_size) / 2;
+        if (physical_ram > 0)
+            g_sysmem_max = physical_ram / 2;
         else
             g_sysmem_max = 8ULL * 1024 * 1024 * 1024; /* 8 GB fallback */
+    }
+
+    if (g_sysmem_pool_target > g_sysmem_max) {
+        LOG_FALLBACK("WARNING: clamping sysmem pool from %.1f GB to max_sysmem %.1f GB",
+                     g_sysmem_pool_target / (1024.0 * 1024.0 * 1024.0),
+                     g_sysmem_max / (1024.0 * 1024.0 * 1024.0));
+        g_sysmem_pool_target = g_sysmem_max;
     }
 
     /* Disable GGML unified memory — the shim replaces UVM's role.
@@ -1003,8 +1301,10 @@ static void shim_init(void) {
         LOG_FALLBACK("unset GGML_CUDA_ENABLE_UNIFIED_MEMORY (shim replaces UVM)");
     }
 
-    LOG_FALLBACK("loaded: max_sysmem=%.1f GB, log_level=%d",
-                 g_sysmem_max / (1024.0 * 1024.0 * 1024.0), g_log_level);
+    LOG_FALLBACK("loaded: max_sysmem=%.1f GB, pool_sysmem=%.1f GB, log_level=%d",
+                 g_sysmem_max / (1024.0 * 1024.0 * 1024.0),
+                 g_sysmem_pool_target / (1024.0 * 1024.0 * 1024.0),
+                 g_log_level);
 }
 
 /* ── Cleanup ─────────────────────────────────────────────────────── */
