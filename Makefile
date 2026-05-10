@@ -4,7 +4,7 @@ CFLAGS = -Wall -Wextra -O2 -fPIC -pthread
 LDFLAGS = -shared -ldl -pthread
 
 TARGET = libcuda_vmm_fallback.so
-SRC = src/shim.c
+SRC = src/shim.c src/stochastic.c
 PREFIX = /usr/local
 
 .PHONY: all clean install uninstall test
@@ -12,7 +12,7 @@ PREFIX = /usr/local
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) $(PREFIX)/lib/$(TARGET)

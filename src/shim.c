@@ -25,6 +25,9 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <time.h>
+
+#include "stochastic.h"
 
 /* ── CUDA Driver API Types ───────────────────────────────────────────
  * Declared manually to avoid requiring CUDA toolkit headers at build time.
@@ -670,7 +673,7 @@ static int get_vmm_device_config(CUdevice device, vmm_device_config_t *config) {
  * sysmem. Both mapped into a single contiguous GPU virtual address.
  * GGML sees one pointer. GPU reads VRAM at 288 GB/s, sysmem at PCIe speed. */
 
-static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
+static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize, size_t headroom_override) {
     vmm_device_config_t config;
     CUdevice device;
     if (!get_active_device(&device) || !get_vmm_device_config(device, &config))
@@ -696,7 +699,7 @@ static CUresult vmm_alloc_split(CUdeviceptr *dptr, size_t bytesize) {
         meminfo_fn(&vram_free, &vram_total);
 
     /* Leave 512 MB headroom for KV cache, compute buffers, driver */
-    size_t headroom = 512ULL * 1024 * 1024;
+    size_t headroom = headroom_override ? headroom_override : (512ULL * 1024 * 1024);
     size_t vram_usable = (vram_free > headroom) ? (vram_free - headroom) : 0;
     /* Round down to granularity */
     vram_usable = (vram_usable / granularity) * granularity;
@@ -920,8 +923,40 @@ CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
     if (err != CUDA_ERROR_OUT_OF_MEMORY)
         return err;
 
-    /* ── VRAM exhausted — attempt sysmem fallback ── */
-    return vmm_alloc_split(dptr, bytesize);
+    /* ── VRAM exhausted — attempt deterministic sysmem fallback ── */
+    CUresult split_err = vmm_alloc_split(dptr, bytesize, 0);
+    if (split_err == CUDA_SUCCESS)
+        return CUDA_SUCCESS;
+
+    /* ── Deterministic failed — stochastic fallback ── */
+    if (stochastic_should_fallback(bytesize)) {
+        const int max_retries = 3;
+        for (int attempt = 0; attempt < max_retries; attempt++) {
+            strat_id_t strat = stochastic_select_strategy();
+            size_t hr = stochastic_headroom_for_strategy(strat);
+            CUresult retry_err;
+
+            if (strat_forces_all_sysmem(strat)) {
+                /* Force all-sysmem by setting headroom larger than any possible VRAM */
+                retry_err = vmm_alloc_split(dptr, bytesize, (size_t)-1);
+            } else {
+                retry_err = vmm_alloc_split(dptr, bytesize, hr);
+            }
+
+            if (retry_err == CUDA_SUCCESS) {
+                stochastic_record_result(strat, true);
+                LOG_FALLBACK("cuMemAlloc(%zu) → STOCHASTIC %s SUCCESS (attempt %d)",
+                             bytesize, stochastic_strat_name(strat), attempt + 1);
+                return CUDA_SUCCESS;
+            }
+
+            stochastic_record_result(strat, false);
+            LOG_FALLBACK("cuMemAlloc(%zu) → STOCHASTIC %s FAILED (attempt %d)",
+                         bytesize, stochastic_strat_name(strat), attempt + 1);
+        }
+    }
+
+    return split_err;
 }
 
 /* ── cuMemFree_v2 Interception ───────────────────────────────────── */
@@ -1300,6 +1335,8 @@ static void shim_init(void) {
         unsetenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
         LOG_FALLBACK("unset GGML_CUDA_ENABLE_UNIFIED_MEMORY (shim replaces UVM)");
     }
+
+    stochastic_init();
 
     LOG_FALLBACK("loaded: max_sysmem=%.1f GB, pool_sysmem=%.1f GB, log_level=%d",
                  g_sysmem_max / (1024.0 * 1024.0 * 1024.0),
