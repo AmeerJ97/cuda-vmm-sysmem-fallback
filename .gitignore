@@ -32,3 +32,4 @@ tests/test_alloc
 *.prof
 *.nsys-rep
 *.ncu-rep
+.codex
